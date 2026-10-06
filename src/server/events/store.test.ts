@@ -1484,6 +1484,52 @@ describe('EventStore - Event Cleanup', () => {
       expect(tail.pendingToolCalls).toBe(1)
     })
 
+    // Every id the counts read, missing or null: an id-less row must neither
+    // count as open (it can never be closed, the cadence would wait for good)
+    // nor hide the rows that are open (`x NOT IN (..., NULL)` is never true).
+    const idLess: Array<[string, (id: unknown) => { type: string; data: Record<string, unknown> }]> = [
+      ['message.start', (id) => ({ type: 'message.start', data: { messageId: id, role: 'assistant', content: '' } })],
+      ['message.done', (id) => ({ type: 'message.done', data: { messageId: id } })],
+      [
+        'tool.call',
+        (id) => ({ type: 'tool.call', data: { messageId: 'a1', toolCall: { id, name: 'read_file', arguments: {} } } }),
+      ],
+      ['tool.result', (id) => ({ type: 'tool.result', data: { messageId: 'a1', toolCallId: id } })],
+    ]
+    for (const [type, event] of idLess) {
+      for (const [label, id] of [
+        ['missing', undefined],
+        ['null', null],
+      ] as const) {
+        it(`counts only what is open when a ${type} id is ${label}`, () => {
+          // Open: message a1 and call c1. Closed: message a2 and call c2.
+          store.append('session-1', {
+            type: 'message.start',
+            data: { messageId: 'a1', role: 'assistant', content: '' },
+          })
+          store.append('session-1', {
+            type: 'tool.call',
+            data: { messageId: 'a1', toolCall: { id: 'c1', name: 'read_file', arguments: {} } },
+          })
+          store.append('session-1', {
+            type: 'message.start',
+            data: { messageId: 'a2', role: 'assistant', content: '' },
+          })
+          store.append('session-1', {
+            type: 'tool.call',
+            data: { messageId: 'a2', toolCall: { id: 'c2', name: 'read_file', arguments: {} } },
+          })
+          store.append('session-1', { type: 'tool.result', data: { messageId: 'a2', toolCallId: 'c2' } } as never)
+          store.append('session-1', { type: 'message.done', data: { messageId: 'a2' } })
+          store.append('session-1', event(id) as never)
+
+          const tail = store.getEventLogTail('session-1', 0)
+          expect(tail.openMessages).toBe(1)
+          expect(tail.pendingToolCalls).toBe(1)
+        })
+      }
+    }
+
     it('does not let a tool result whose call is before the tail hide a pending call', () => {
       store.append('session-1', {
         type: 'tool.call',
