@@ -546,35 +546,55 @@ export function reorderToolMessages(messages: MessageWithId[]): void {
   }
 }
 
+/**
+ * Expand the latest `turn.snapshot` into synthetic events plus the raw events
+ * that followed it, so any consumer folds a snapshot-compacted history exactly
+ * like raw events. The snapshot is a point-in-time capture of complete
+ * messages; its messages stay authoritative, and later raw events targeting a
+ * messageId already covered by the snapshot (only conceivable after an
+ * abort-snapshot) are dropped so a later delta/thinking/tool.result can never
+ * double-append. The shared expansion is what keeps the top-level and
+ * sub-agent folds from drifting apart (see #2).
+ */
+export function expandSnapshotEvents(events: StoredEvent[]): StoredEvent[] {
+  const snapshotEvent = [...events].reverse().find((event) => event.type === 'turn.snapshot')
+  if (!snapshotEvent) return events
+
+  const snapshot = snapshotEvent.data as SessionSnapshot
+  const snapshotMessageIds = new Set(snapshot.messages.map((message) => message.id))
+  // Exception: an event that *completes* the snapshot rather than duplicating
+  // it must be kept. A mid-turn snapshot can capture a tool call whose result
+  // has not been emitted yet — a sub-agent's cadence fires while its parent
+  // turn is still awaiting that call, and cleanupOldEvents() then deletes the
+  // parent's raw `tool.call` row. Dropping the parent's later `tool.result`
+  // would leave the snapshot's tool call unfulfilled, and
+  // stripOrphanedToolCalls would remove the call from the message entirely,
+  // silently losing the sub-agent's return value from the parent's context.
+  const unresolvedToolCallIds = new Set<string>()
+  for (const message of snapshot.messages) {
+    for (const toolCall of message.toolCalls ?? []) {
+      if (toolCall.result === undefined) unresolvedToolCallIds.add(toolCall.id)
+    }
+  }
+  const laterEvents = events.filter((event) => {
+    if (event.seq <= snapshotEvent.seq) return false
+    if (!('messageId' in event.data)) return true
+    if (!snapshotMessageIds.has((event.data as { messageId: string }).messageId)) return true
+    // The snapshot already holds this message. Keep only what completes it.
+    if (event.type !== 'tool.result') return false
+    const toolCallId = (event.data as { toolCallId?: string }).toolCallId
+    return toolCallId !== undefined && unresolvedToolCallIds.has(toolCallId)
+  })
+
+  return [...snapshotMessagesToEvents(snapshot.messages, snapshotEvent.sessionId), ...laterEvents]
+}
+
 export function buildContextMessagesFromEventHistory(
   events: StoredEvent[],
   windowId?: string,
   options?: ContextMessageBuildOptions,
 ): ContextMessage[] {
-  const snapshotEvent = [...events].reverse().find((event) => event.type === 'turn.snapshot')
-  if (!snapshotEvent) {
-    return buildContextMessagesFromStoredEvents(events, windowId, options)
-  }
-  const snapshot = snapshotEvent.data as SessionSnapshot
-
-  // The snapshot is a point-in-time capture of complete messages. Later events
-  // belong to subsequent turns and carry their own messageIds. Events targeting
-  // a messageId already covered by the snapshot (only conceivable after an
-  // abort-snapshot) are dropped, exactly as the pre-unification fold did — the
-  // snapshot content stays authoritative and synthetic events can never be
-  // double-appended by a later delta/thinking/tool.result.
-  const snapshotMessageIds = new Set(snapshot.messages.map((message) => message.id))
-  const laterEvents = events.filter(
-    (event) =>
-      event.seq > snapshotEvent.seq &&
-      !('messageId' in event.data && snapshotMessageIds.has((event.data as { messageId: string }).messageId)),
-  )
-
-  return buildContextMessagesFromStoredEvents(
-    [...snapshotMessagesToEvents(snapshot.messages, snapshotEvent.sessionId), ...laterEvents],
-    windowId,
-    options,
-  )
+  return buildContextMessagesFromStoredEvents(expandSnapshotEvents(events), windowId, options)
 }
 
 export function foldTurnEventsToSnapshotMessages(events: EventLike[]): SnapshotMessage[] {

@@ -26,6 +26,7 @@ import { minimalMessagesToRequestContextMessages } from './request-context.js'
 import {
   buildContextMessagesFromEventHistory,
   collectCarriedMessageIds,
+  expandSnapshotEvents,
   foldContextState,
   placeCarriedRounds,
 } from '../events/folding.js'
@@ -94,22 +95,31 @@ function buildTopLevelContextMessages(events: StoredEvent[], scope: TopLevelScop
 // Sub-Agent Scope
 // ============================================================================
 
-function buildSubAgentContextMessages(events: StoredEvent[], scope: SubAgentScope): ContextMessage[] {
+function buildSubAgentContextMessages(rawEvents: StoredEvent[], scope: SubAgentScope): ContextMessage[] {
   const { subAgentId } = scope
+  // Expand the latest snapshot first: a mid-turn snapshot absorbs (and
+  // cleanupOldEvents then prunes) this sub-agent's earlier messages, so reading
+  // raw events only would drop its task and work. The top-level fold already
+  // shares this expansion (see #2).
+  const events = expandSnapshotEvents(rawEvents)
   const messages: InternalMessage[] = []
   const messageMap = new Map<string, InternalMessage>()
   const fulfilledToolCallIds = new Set<string>()
 
-  // Find the most recent sub-agent compaction boundary
+  // Find the most recent sub-agent compaction boundary: the summary message.
+  // The boundary must come from the summary message, not the context.compacted
+  // event — a snapshot replay carries the summary message (isCompactionSummary
+  // + subAgentId) but not the context.compacted stub, whose replayed form keeps
+  // only window ids/timestamp and no subAgentId, so it is indistinguishable
+  // from a main-turn compaction for anything filtering on that field.
   let compactionSummaryIndex = -1
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i]!
-    if (event.type === 'context.compacted') {
-      const data = event.data as Extract<TurnEvent, { type: 'context.compacted' }>['data']
-      if (data.subAgentId === subAgentId) {
-        compactionSummaryIndex = i
-        break
-      }
+    if (event.type !== 'message.start') continue
+    const data = event.data as Extract<TurnEvent, { type: 'message.start' }>['data']
+    if (data.subAgentId === subAgentId && data.isCompactionSummary === true) {
+      compactionSummaryIndex = i
+      break
     }
   }
 
@@ -192,14 +202,6 @@ function buildSubAgentContextMessages(events: StoredEvent[], scope: SubAgentScop
       case 'tool.result': {
         const evt = event.data as Extract<TurnEvent, { type: 'tool.result' }>['data']
         handleToolResult(messages, messageMap, fulfilledToolCallIds, evt)
-        break
-      }
-      case 'context.compacted': {
-        const data = event.data as Extract<TurnEvent, { type: 'context.compacted' }>['data']
-        if (data.subAgentId === subAgentId && i === compactionSummaryIndex) {
-          // The summary message follows this event; we include it as a user message
-          // It will be picked up by message.start events with isCompactionSummary
-        }
         break
       }
     }

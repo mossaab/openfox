@@ -7,7 +7,7 @@ import {
   getConversationMessages,
   ensureRequestNotEndingWithAssistant,
 } from './conversation-history.js'
-import { buildContextMessagesFromEventHistory } from '../events/folding.js'
+import { buildContextMessagesFromEventHistory, foldTurnEventsToSnapshotMessages } from '../events/folding.js'
 import { getEventStore } from '../events/store.js'
 
 vi.mock('../events/store.js', () => ({
@@ -240,6 +240,73 @@ describe('buildContextMessages', () => {
       expect(result[0]!.toolCalls).toHaveLength(1)
       expect(result[1]!.role).toBe('tool')
       expect(result[1]!.toolCallId).toBe('call-1')
+    })
+
+    it('keeps a tool result that completes a tool call the snapshot left unresolved', () => {
+      // A sub-agent's cadence can snapshot mid-parent-turn: the parent's tool
+      // call is still awaiting its result, so the snapshot embeds it without
+      // one, and cleanupOldEvents() then deletes the parent's raw `tool.call`.
+      // Dropping the parent's later `tool.result` would leave the call
+      // unfulfilled, and stripOrphanedToolCalls would remove the call from the
+      // message entirely — losing the sub-agent's return value from context.
+      const snapshotSeq = 10
+      const events: StoredEvent[] = [
+        makeEvent({
+          seq: 1,
+          type: 'session.initialized',
+          data: { projectId: 'p1', workdir: '/tmp', contextWindowId: 'window-1' },
+        }),
+        makeEvent({
+          seq: snapshotSeq,
+          type: 'turn.snapshot',
+          data: {
+            mode: 'planner',
+            phase: 'plan',
+            isRunning: true,
+            messages: [
+              {
+                id: 'm1',
+                role: 'assistant',
+                content: 'delegating to a sub-agent',
+                timestamp: 5,
+                contextWindowId: 'window-1',
+                toolCalls: [{ id: 'call-1', name: 'task', arguments: { prompt: 'do it' } }],
+              },
+            ],
+            criteria: [],
+            metadataEntries: {},
+            contextState: {
+              currentTokens: 0,
+              maxTokens: 200000,
+              compactionCount: 0,
+              dangerZone: false,
+              canCompact: false,
+              dynamicContextChanged: false,
+            },
+            currentContextWindowId: 'window-1',
+            todos: [],
+            snapshotSeq,
+            snapshotAt: 5,
+          },
+        }),
+        makeEvent({
+          seq: snapshotSeq + 1,
+          type: 'tool.result',
+          data: {
+            messageId: 'm1',
+            toolCallId: 'call-1',
+            result: { success: true, output: 'sub-agent done', durationMs: 10, truncated: false },
+          },
+        }),
+      ]
+
+      const result = buildContextMessagesFromEventHistory(events, 'window-1', { includeVerifier: false })
+
+      const assistant = result.find((message) => message.role === 'assistant' && message.toolCalls?.length)
+      expect(assistant?.toolCalls?.[0]?.id).toBe('call-1')
+      const toolMessage = result.find((message) => message.role === 'tool')
+      expect(toolMessage?.toolCallId).toBe('call-1')
+      expect(toolMessage?.content).toContain('sub-agent done')
     })
 
     it('produces the same output as buildContextMessagesFromEventHistory for top-level scope', () => {
@@ -628,6 +695,92 @@ describe('buildContextMessages', () => {
       // The pre-compaction exchanges stay out; what follows the summary stays in.
       expect(result.some((m) => m.toolCalls?.some((c) => c.id === 'call-4'))).toBe(true)
       expect(result.filter((m) => m.role === 'user')).toHaveLength(1)
+    })
+
+    it('keeps the sub-agent context when a mid-turn snapshot absorbed its earlier messages', () => {
+      // A snapshot taken while the sub-agent runs absorbs its earlier messages
+      // (cleanupOldEvents then prunes those raw events). The sub-agent context
+      // must expand the snapshot instead of reading raw events only, or the
+      // sub-agent loses its task and work on its next request.
+      const sub = { subAgentId: 'sub-1', subAgentType: 'explorer' }
+      const start = (messageId: string, role: 'user' | 'assistant', extra: Record<string, unknown> = {}) =>
+        makeEvent({
+          seq: nextSeq(),
+          type: 'message.start',
+          data: { messageId, role, contextWindowId: 'window-1', ...sub, ...extra },
+        })
+      const call = (messageId: string, id: string) => [
+        makeEvent({
+          seq: nextSeq(),
+          type: 'tool.call',
+          data: { messageId, toolCall: { id, name: 'run_command', arguments: { command: id } } },
+        }),
+        makeEvent({
+          seq: nextSeq(),
+          type: 'tool.result',
+          data: {
+            messageId,
+            toolCallId: id,
+            result: { success: true, output: `out ${id}`, durationMs: 1, truncated: false },
+          },
+        }),
+      ]
+
+      // The sub-agent's work before the snapshot: its task and one round.
+      const preSnapshot: StoredEvent[] = [
+        start('task', 'user', { content: 'Run ./gen.sh 1 to 8' }),
+        makeEvent({ seq: nextSeq(), type: 'message.done', data: { messageId: 'task' } }),
+        start('a1', 'assistant'),
+        ...call('a1', 'c1'),
+        makeEvent({ seq: nextSeq(), type: 'message.done', data: { messageId: 'a1' } }),
+      ]
+
+      // The snapshot absorbs those messages; only it (plus the sub-agent's
+      // post-snapshot continuation) survives cleanup.
+      const snapshot = makeEvent({
+        seq: nextSeq(),
+        type: 'turn.snapshot',
+        data: {
+          mode: 'builder',
+          phase: 'build',
+          isRunning: true,
+          messages: foldTurnEventsToSnapshotMessages(preSnapshot),
+          criteria: [],
+          metadataEntries: {},
+          contextState: {
+            currentTokens: 0,
+            maxTokens: 200000,
+            compactionCount: 0,
+            dangerZone: false,
+            canCompact: false,
+            dynamicContextChanged: false,
+          },
+          currentContextWindowId: 'window-1',
+          todos: [],
+          readFiles: [],
+          snapshotSeq: 50,
+          snapshotAt: 1,
+        },
+      })
+
+      // Post-snapshot continuation of the same sub-agent.
+      const postSnapshot: StoredEvent[] = [
+        start('a2', 'assistant'),
+        ...call('a2', 'c2'),
+        makeEvent({ seq: nextSeq(), type: 'message.done', data: { messageId: 'a2' } }),
+      ]
+
+      const result = buildContextMessages([snapshot, ...postSnapshot], {
+        type: 'subagent',
+        sessionId: 'session-1',
+        ...sub,
+      })
+
+      // The task and the pre-snapshot round come back from the snapshot...
+      expect(result[0]).toMatchObject({ role: 'user', content: 'Run ./gen.sh 1 to 8' })
+      expect(result.some((m) => m.toolCalls?.some((c) => c.id === 'c1'))).toBe(true)
+      // ...and the post-snapshot round is still there.
+      expect(result.some((m) => m.toolCalls?.some((c) => c.id === 'c2'))).toBe(true)
     })
 
     it('puts the round a sub-agent compaction carried right after the summary', () => {

@@ -29,6 +29,7 @@ export {
   stripOrphanedToolCalls,
   reorderToolMessages,
   buildContextMessagesFromEventHistory,
+  expandSnapshotEvents,
   collectCarriedMessageIds,
   placeCarriedRounds,
   buildSessionStatsMessages,
