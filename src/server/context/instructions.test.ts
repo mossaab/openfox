@@ -8,6 +8,7 @@ import { createProject, updateProject } from '../db/projects.js'
 import { setSetting, SETTINGS_KEYS } from '../db/settings.js'
 import {
   buildLanguageInstruction,
+  clearInstructionCache,
   findInstructionFiles,
   getAllInstructions,
   getInstructionsForWorkdir,
@@ -20,6 +21,7 @@ describe('instructions', () => {
 
   beforeEach(async () => {
     closeDatabase()
+    clearInstructionCache()
     const config = loadConfig()
     config.database.path = ':memory:'
     initDatabase(config)
@@ -30,6 +32,7 @@ describe('instructions', () => {
 
   afterEach(async () => {
     closeDatabase()
+    clearInstructionCache()
     // Clean up temp directory
     await rm(testDir, { recursive: true, force: true })
   })
@@ -243,6 +246,36 @@ describe('instructions', () => {
 
       expect(result.content).toBe('')
       expect(result.files).toEqual([])
+    })
+
+    it('reads an unchanged instruction file only once across repeated calls', async () => {
+      const project = createProject('OpenFox', testDir)
+      await writeFile(join(testDir, 'AGENTS.md'), '# Cached instructions')
+
+      const first = await getAllInstructions(testDir, project.id)
+      const second = await getAllInstructions(testDir, project.id)
+
+      expect(first.content).toContain('# Cached instructions')
+      expect(second.content).toBe(first.content)
+      // The file's content is the same instance served from the cache (not re-read).
+      expect(second.files[0]?.content).toBe(first.files[0]?.content)
+    })
+
+    it('picks up an edited instruction file (cache invalidates on mtime/size)', async () => {
+      const project = createProject('OpenFox', testDir)
+      const path = join(testDir, 'AGENTS.md')
+      await writeFile(path, '# Version one')
+
+      const first = await getAllInstructions(testDir, project.id)
+      expect(first.content).toContain('# Version one')
+
+      // Ensure a distinct mtime/size, then edit.
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      await writeFile(path, '# Version two, longer content')
+
+      const second = await getAllInstructions(testDir, project.id)
+      expect(second.content).toContain('# Version two, longer content')
+      expect(second.content).not.toContain('# Version one')
     })
   })
 })

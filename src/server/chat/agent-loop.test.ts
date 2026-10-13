@@ -3138,3 +3138,154 @@ describe('runTopLevelAgentLoop night mode', () => {
     expect(seenContexts[1]?.nightMode).toBeUndefined()
   })
 })
+
+// ============================================================================
+// maxTurns — hard cap on LLM rounds (runaway-loop guard)
+// ============================================================================
+
+describe('runTopLevelAgentLoop maxTurns', () => {
+  let mockEventStore: EventStore
+  let mockSessionManager: any
+  let mockLLMClient: any
+  let mockTurnMetrics: TurnMetrics
+  let mockToolRegistry: ToolRegistry
+  let assembleRequestMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+
+    mockEventStore = {
+      append: vi.fn(),
+      getEvents: vi.fn().mockReturnValue([]),
+      getLatestSeq: vi.fn().mockReturnValue(0),
+      cleanupOldEvents: vi.fn().mockReturnValue(0),
+    } as unknown as EventStore
+    ;(getEventStore as any).mockReturnValue(mockEventStore)
+
+    mockLLMClient = { getModel: vi.fn().mockReturnValue('test-model') }
+
+    mockTurnMetrics = {
+      addToolTime: vi.fn(),
+      addLLMCall: vi.fn(),
+      addThinkingTime: vi.fn(),
+      buildStats: vi.fn().mockReturnValue({}),
+    } as unknown as TurnMetrics
+
+    assembleRequestMock = vi.fn().mockReturnValue({ systemPrompt: 'test-system-prompt', messages: [] })
+    ;(getAllInstructions as any).mockResolvedValue({ content: 'test instructions', files: [] })
+    ;(getEnabledSkillMetadata as any).mockResolvedValue([])
+
+    mockToolRegistry = {
+      tools: [],
+      definitions: [],
+      execute: vi.fn().mockResolvedValue({ success: true, output: 'ok', durationMs: 0, truncated: false }),
+    } as unknown as ToolRegistry
+
+    mockSessionManager = {
+      enterPauseGate: vi.fn().mockResolvedValue('released'),
+      requireSession: vi.fn().mockReturnValue({
+        workdir: '/test',
+        projectId: 'test-project',
+        executionState: null,
+        criteria: [],
+        isRunning: false,
+      }),
+      getEffectiveWorkdir: vi.fn().mockReturnValue('/test'),
+      getProjectWorkdir: vi.fn().mockReturnValue('/test'),
+      getContextState: vi.fn().mockReturnValue({
+        currentTokens: 0,
+        maxTokens: 200000,
+        compactionCount: 0,
+        dangerZone: false,
+        canCompact: false,
+        dynamicContextChanged: false,
+      }),
+      getCurrentModelContext: vi.fn().mockReturnValue(200000),
+      getCurrentModelSettings: vi.fn().mockReturnValue({}),
+      getModelCompactionThreshold: vi.fn().mockReturnValue(undefined),
+      setCurrentContextSize: vi.fn(),
+      getDynamicContextChanged: vi.fn().mockReturnValue(false),
+      setDynamicContextChanged: vi.fn(),
+      getCachedPrompt: vi.fn().mockReturnValue(undefined),
+      setCachedPrompt: vi.fn(),
+      getLspManager: vi.fn(),
+      drainAsapMessages: vi.fn().mockReturnValue([]),
+      getQueueState: vi.fn().mockReturnValue([]),
+      getCurrentWindowMessages: vi.fn().mockReturnValue([]),
+      updateMessage: vi.fn(),
+    }
+  })
+
+  function makeConfig(overrides?: Partial<TopLevelLoopConfig>): TopLevelLoopConfig {
+    return {
+      mode: 'planner',
+      append: vi.fn(),
+      sessionManager: mockSessionManager,
+      sessionId: 'test-session',
+      llmClient: mockLLMClient,
+      statsIdentity: { providerId: 'test', providerName: 'Test', backend: 'unknown' as const, model: 'test-model' },
+      assembleRequest: assembleRequestMock as any,
+      getToolRegistry: () => mockToolRegistry as any,
+      getConversationMessages: vi.fn().mockResolvedValue([]),
+      onMessage: vi.fn(),
+      ...overrides,
+    }
+  }
+
+  // A round that always calls a tool → the loop would never terminate on its own.
+  const endlessToolRound = {
+    content: '',
+    toolCalls: [{ id: 'call-1', name: 'read_file', arguments: { path: 'a.ts' } }],
+    segments: [],
+    usage: { promptTokens: 10, completionTokens: 5 },
+    timing: { ttft: 0.1, completionTime: 0.5, tps: 10, prefillTps: 100 },
+    aborted: false,
+    finishReason: 'tool_calls',
+    modelParams: {},
+  }
+
+  it('stops a runaway tool loop after maxTurns LLM rounds', async () => {
+    ;(consumeStreamGenerator as any).mockResolvedValue(endlessToolRound)
+
+    await runTopLevelAgentLoop(makeConfig({ maxTurns: 3 }), mockTurnMetrics)
+
+    // The LLM is called at most `maxTurns` times, never unbounded.
+    expect((consumeStreamGenerator as any).mock.calls.length).toBeLessThanOrEqual(3)
+  })
+
+  it('emits a visible system notice and a truncated chat.done when the cap is hit', async () => {
+    ;(consumeStreamGenerator as any).mockResolvedValue(endlessToolRound)
+    const append = vi.fn()
+
+    await runTopLevelAgentLoop(makeConfig({ maxTurns: 2, append: append as any }), mockTurnMetrics)
+
+    const appended = append.mock.calls.map((c) => c[0] as { type: string; data: Record<string, unknown> })
+    const notice = appended.find(
+      (e) =>
+        e.type === 'message.start' &&
+        typeof e.data['content'] === 'string' &&
+        (e.data['content'] as string).includes('round limit'),
+    )
+    expect(notice).toBeDefined()
+    const done = appended.find((e) => e.type === 'chat.done')
+    expect(done?.data['reason']).toBe('truncated')
+  })
+
+  it('does not cap the loop when maxTurns is 0 (disabled)', async () => {
+    ;(consumeStreamGenerator as any)
+      .mockResolvedValueOnce(endlessToolRound)
+      .mockResolvedValueOnce(endlessToolRound)
+      .mockResolvedValueOnce(endlessToolRound)
+      .mockResolvedValueOnce(endlessToolRound)
+      .mockResolvedValue({
+        ...endlessToolRound,
+        toolCalls: [],
+        finishReason: 'stop',
+      })
+
+    await runTopLevelAgentLoop(makeConfig({ maxTurns: 0 }), mockTurnMetrics)
+
+    // Four tool rounds ran (more than the would-be cap of 3) before the no-tool round terminated.
+    expect((consumeStreamGenerator as any).mock.calls.length).toBe(5)
+  })
+})

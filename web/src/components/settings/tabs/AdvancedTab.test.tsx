@@ -66,6 +66,19 @@ describe('AdvancedTab', () => {
     expect(mockSetSetting).toHaveBeenCalledWith('agent.allowParallelSubAgents', 'true')
   })
 
+  it('renders the max agent turns field and persists it on blur', async () => {
+    mockSettings['agent.maxTurns'] = '100'
+    const { container } = render(<AdvancedTab onClose={vi.fn()} />)
+    expect(container.textContent).toContain('Max agent turns')
+    const input = container.querySelector('input[type="number"]') as HTMLInputElement
+    expect(input).toBeTruthy()
+    expect(input.value).toBe('100')
+    await userEvent.setup().clear(input)
+    await userEvent.setup().type(input, '42')
+    input.blur()
+    expect(mockSetSetting).toHaveBeenCalledWith('agent.maxTurns', '42')
+  })
+
   it('renders the Speculative Cache Warming toggle', () => {
     const { container } = render(<AdvancedTab onClose={vi.fn()} />)
     expect(container.textContent).toContain('Speculative Cache Warming')

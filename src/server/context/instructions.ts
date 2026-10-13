@@ -1,4 +1,4 @@
-import { readFile, access } from 'node:fs/promises'
+import { readFile, access, stat } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { constants } from 'node:fs'
 import { getSetting, SETTINGS_KEYS } from '../db/settings.js'
@@ -29,6 +29,52 @@ export function buildLanguageInstruction(language: string | null | undefined): s
 
 // Filenames to look for (in order of priority within same directory)
 const INSTRUCTION_FILENAMES = ['AGENTS.md', 'CLAUDE.md']
+
+// ============================================================================
+// File-content cache
+// ============================================================================
+
+/**
+ * Cache of instruction-file contents, keyed by absolute path.
+ *
+ * `getAllInstructions()` runs on **every** iteration of the agent loop and for
+ * every sub-agent. Without a cache the same AGENTS.md is read from disk (twice:
+ * `loadInstructions` then the per-file `readFile` loop) on each call — for a
+ * large instruction file on a long loop that is hundreds of MB of redundant I/O
+ * and a needless stall before each LLM request. The cache invalidates on
+ * (mtimeMs, size), so an edited file is picked up immediately while an
+ * unchanged file is served from memory.
+ */
+interface CachedFile {
+  mtimeMs: number
+  size: number
+  content: string
+}
+
+const fileContentCache = new Map<string, CachedFile>()
+
+/** Read a file, returning a cached copy while its (mtimeMs, size) is unchanged. */
+async function readCachedFile(path: string): Promise<string | undefined> {
+  try {
+    const stats = await stat(path)
+    const cached = fileContentCache.get(path)
+    if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+      return cached.content
+    }
+    const content = await readFile(path, 'utf-8')
+    fileContentCache.set(path, { mtimeMs: stats.mtimeMs, size: stats.size, content })
+    return content
+  } catch {
+    // Unreadable / removed: drop any stale entry and report the miss.
+    fileContentCache.delete(path)
+    return undefined
+  }
+}
+
+/** Drop the whole cache (tests / explicit invalidation). */
+export function clearInstructionCache(): void {
+  fileContentCache.clear()
+}
 
 // ============================================================================
 // Discovery
@@ -75,18 +121,16 @@ export async function findInstructionFiles(workdir: string): Promise<Instruction
 /**
  * Load instruction content from files.
  * Each file's content is prefixed with a comment showing its source path.
+ * Contents are served through the (mtimeMs, size)-invalidated cache, so an
+ * unchanged file is never read from disk more than once.
  */
 export async function loadInstructions(files: InstructionFile[]): Promise<string> {
   const contents: string[] = []
 
   for (const file of files) {
-    try {
-      const content = await readFile(file.path, 'utf-8')
-      contents.push(`Instructions from: ${file.path}\n${content}`)
-    } catch {
-      // File doesn't exist or can't be read - skip silently
-      continue
-    }
+    const content = await readCachedFile(file.path)
+    if (content === undefined) continue
+    contents.push(`Instructions from: ${file.path}\n${content}`)
   }
 
   return contents.join('\n')
@@ -137,18 +181,27 @@ export async function getAllInstructions(workdir: string, projectId: string): Pr
   // 3. AGENTS.md files (from filesystem)
   const agentFiles = await findInstructionFiles(workdir)
   if (agentFiles.length > 0) {
-    const agentContent = await loadInstructions(agentFiles)
-    if (agentContent) {
+    const fileContents: { file: InstructionFile; content: string }[] = []
+    for (const file of agentFiles) {
+      // Single read per file (cached): the same content feeds both the
+      // concatenated prompt section and the per-file entries below.
+      const content = await readCachedFile(file.path)
+      if (content !== undefined) fileContents.push({ file, content })
+    }
+    if (fileContents.length > 0) {
+      const agentContent = fileContents
+        .map(({ file, content }) => `Instructions from: ${file.path}\n${content}`)
+        .join('\n')
       sections.push(`## FILE INSTRUCTIONS\n\n${agentContent}`)
-      // Load content for each file
-      for (const file of agentFiles) {
-        try {
-          const content = await readFile(file.path, 'utf-8')
-          allFiles.push({ ...file, content })
-        } catch {
-          allFiles.push(file)
-        }
+      for (const { file, content } of fileContents) {
+        allFiles.push({ ...file, content })
       }
+    }
+    // A file discovered but unreadable (removed between the walk and the read)
+    // is still reported, without content — mirrors the previous behaviour.
+    const unreadable = agentFiles.filter((f) => !fileContents.some((fc) => fc.file.path === f.path))
+    for (const file of unreadable) {
+      allFiles.push(file)
     }
   }
 

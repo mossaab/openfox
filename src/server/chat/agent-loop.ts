@@ -40,6 +40,7 @@ import { getGlobalConfigDir } from '../../cli/paths.js'
 import { getSetting, SETTINGS_KEYS } from '../db/settings.js'
 import {
   createChatMessageUpdatedMessage,
+  createChatMessageMessage,
   createChatDoneMessage,
   createChatLLMRetryMessage,
   createChatLLMRetryFailedMessage,
@@ -204,6 +205,12 @@ export interface TopLevelLoopConfig {
   requireReturnValue?: boolean
   /** Maximum number of return_value nudges before giving up. Default 10. */
   maxReturnValueNudges?: number
+  /** Hard cap on the number of LLM rounds (outer-loop iterations) for this run.
+   *  Bounds a runaway sub-agent/agent loop that keeps calling tools without ever
+   *  finishing (the observed 4 000-call verifier). When exceeded, the loop emits
+   *  a `truncated` done event and stops. Defaults to the `agent.maxTurns` setting
+   *  (100); `0`/absent in the setting disables the cap. */
+  maxTurns?: number
   /** Build conversation messages for the LLM, with image processing applied.
    *  Called each iteration to get fresh context. */
   getConversationMessages: () => Promise<RequestContextMessage[]>
@@ -284,6 +291,11 @@ export async function runTopLevelAgentLoop(
   // carries into the next window, after the summary (see the compacting branch).
   let carriedRound: typeof pendingRound
   let returnValueNudgeCount = 0
+  // Hard cap on LLM rounds for this run (see `maxTurns`). Read once, then bounded
+  // per iteration. `0` disables the cap (unbounded, legacy behaviour).
+  const configuredMaxTurns = config.maxTurns ?? Number.parseInt(getSetting(SETTINGS_KEYS.AGENT_MAX_TURNS) ?? '', 10)
+  const maxTurns = Number.isFinite(configuredMaxTurns) && configuredMaxTurns > 0 ? configuredMaxTurns : 0
+  let turnCount = 0
 
   /** Context size the auto-compaction is decided on, its window and threshold. */
   const compactionMeasure = () => {
@@ -356,6 +368,43 @@ export async function runTopLevelAgentLoop(
 
       return {}
     }
+
+    // Hard cap on LLM rounds: a runaway loop (a sub-agent that keeps calling
+    // tools without finishing) is bounded here. Emit a visible notice + a final
+    // done so the UI closes the bubble, log loudly, and stop.
+    if (maxTurns > 0 && turnCount >= maxTurns) {
+      logger.warn('Agent loop reached maxTurns — stopping', {
+        sessionId,
+        subAgentType: config.subAgentMetadata?.subAgentType,
+        maxTurns,
+      })
+      const capMsgId = crypto.randomUUID()
+      append(
+        createMessageStartEvent(
+          capMsgId,
+          'system',
+          `⚠️ Agent loop stopped after reaching the ${maxTurns}-round limit (agent.maxTurns). ` +
+            'The task may be incomplete — raise the limit or narrow the request.',
+          { isSystemGenerated: true, ...subAgentTags() },
+        ),
+      )
+      append({ type: 'message.done', data: { messageId: capMsgId } })
+      onMessage?.(
+        createChatMessageMessage({
+          id: capMsgId,
+          role: 'system',
+          content: `⚠️ Agent loop stopped after reaching the ${maxTurns}-round limit (agent.maxTurns).`,
+          timestamp: new Date().toISOString(),
+          isSystemGenerated: true,
+          ...(config.subAgentMetadata
+            ? { subAgentId: config.subAgentMetadata.subAgentId, subAgentType: config.subAgentMetadata.subAgentType }
+            : {}),
+        }),
+      )
+      append(createChatDoneEvent(capMsgId, 'truncated', undefined, agentType))
+      break
+    }
+    turnCount++
 
     // Pause gate: block before the next LLM request if the user requested a
     // pause. The current (in-flight) request is never aborted — the pause only

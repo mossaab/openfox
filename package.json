@@ -73,7 +73,8 @@
     "postinstall": "node scripts/postinstall.mjs",
     "test:publish:e2e": "tsx scripts/run-publish-e2e.ts",
     "test:publish:e2e:prod": "cross-env OPENFOX_PUBLISH_E2E_LLM=prod tsx scripts/run-publish-e2e.ts",
-    "verify:pack": "tsx scripts/verify-pack.ts"
+    "verify:pack": "tsx scripts/verify-pack.ts",
+    "measure:workflow-runs": "tsx scripts/measure-workflow-runs.ts"
   },
   "dependencies": {
     "@clack/prompts": "^1.1.0",

@@ -24,6 +24,7 @@ export function AdvancedTab({ onClose }: { onClose: () => void }) {
   const cacheWarming = useSetting(SETTINGS_KEYS.CACHE_WARMING).value === 'true'
   const autoContinueOnBoot = useSetting(SETTINGS_KEYS.AUTO_CONTINUE_ON_BOOT).value === 'true'
   const parallelSubAgents = useSetting(SETTINGS_KEYS.AGENT_ALLOW_PARALLEL_SUB_AGENTS).value === 'true'
+  const maxTurnsSetting = useSetting(SETTINGS_KEYS.AGENT_MAX_TURNS, '100').value
   const retryPatternsSetting = useSetting(SETTINGS_KEYS.RETRY_PATTERNS).value
   const proxyUrlSetting = useSetting(SETTINGS_KEYS.PROXY_URL).value
   const vscodeRemotePrefixSetting = useSetting(SETTINGS_KEYS.VSCODE_REMOTE_PREFIX).value
@@ -43,6 +44,7 @@ export function AdvancedTab({ onClose }: { onClose: () => void }) {
   const [proxyUrl, setProxyUrl] = useState('')
   const [vscodeRemotePrefix, setVscodeRemotePrefix] = useState('')
   const [defaultAgent, setDefaultAgent] = useState('')
+  const [maxTurns, setMaxTurns] = useState(maxTurnsSetting)
   const [defaultAgentLoaded, setDefaultAgentLoaded] = useState(false)
   const [proxyTestText, proxyTestError, proxyTestSuccess, testProxy] = useTestButton()
   const [showUpdateModal, setShowUpdateModal] = useState(false)
@@ -282,6 +284,26 @@ export function AdvancedTab({ onClose }: { onClose: () => void }) {
         onToggle={handleToggleParallelSubAgents}
         boldTitle
       />
+      <hr className="border-border" />
+      <div>
+        <h3 className="text-sm font-medium text-text-primary mb-1">
+          {t({ en: 'Max agent turns', fr: 'Tours d’agent maximum' })}
+        </h3>
+        <p className="text-sm text-text-muted mb-4">
+          {t({
+            en: 'Hard cap on the number of LLM rounds a single agent or sub-agent run may take. Stops a runaway tool loop (a step that never finishes). Set to 0 to disable the cap.',
+            fr: 'Plafond du nombre de tours LLM qu’un agent ou sous-agent peut enchaîner. Stoppe une boucle d’outils qui ne se termine jamais. Mettre 0 pour désactiver le plafond.',
+          })}
+        </p>
+        <Input
+          type="number"
+          min={0}
+          value={maxTurns}
+          onChange={(e) => setMaxTurns(e.target.value)}
+          onBlur={() => void setSetting(SETTINGS_KEYS.AGENT_MAX_TURNS, String(Math.max(0, Number(maxTurns) || 0)))}
+          className="max-w-[160px]"
+        />
+      </div>
       <hr className="border-border" />
       <div>
         <h3 className="text-sm font-medium text-text-primary mb-1">{t({ en: 'Onboarding', fr: 'Prise en main' })}</h3>

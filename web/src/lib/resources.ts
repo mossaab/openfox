@@ -635,6 +635,7 @@ export const SETTINGS_KEYS = {
   CACHE_WARMING: 'cache.warming',
   AUTO_CONTINUE_ON_BOOT: 'agent.autoContinueOnBoot',
   AGENT_ALLOW_PARALLEL_SUB_AGENTS: 'agent.allowParallelSubAgents',
+  AGENT_MAX_TURNS: 'agent.maxTurns',
   KEYBINDINGS: 'keybindings',
   RETRY_PATTERNS: 'agent.retryPatterns',
   SKILLS_DIRECTORIES: 'skills.directories',
