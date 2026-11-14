@@ -112,6 +112,7 @@ describe('runTopLevelAgentLoop pause gate', () => {
       append: vi.fn(),
       getEvents: vi.fn().mockReturnValue([]),
       getContextWindowEvents: vi.fn().mockReturnValue([]),
+      getCurrentContextWindowId: vi.fn().mockReturnValue(undefined),
       getLatestSeq: vi.fn().mockReturnValue(0),
       cleanupOldEvents: vi.fn().mockReturnValue(0),
     } as unknown as EventStore

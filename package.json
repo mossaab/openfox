@@ -47,6 +47,7 @@
     "test:e2e": "vitest run --reporter=dot --silent=passed-only --config e2e/vitest.config.ts",
     "test:playwright": "playwright test --config=e2e-playwright/playwright.config.ts",
     "bench:web": "tsx scripts/bench/web-memory.ts",
+    "bench:context-window": "tsx scripts/bench/context-window.ts",
     "optimize:snapshots": "tsx scripts/optimize-snapshots.ts",
     "test:playwright:ui": "playwright test --config=e2e-playwright/playwright.config.ts --ui",
     "test:playwright:headed": "playwright test --config=e2e-playwright/playwright.config.ts --headed",

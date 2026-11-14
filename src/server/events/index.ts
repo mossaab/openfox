@@ -28,7 +28,7 @@
  */
 
 // Store
-export { EventStore, initEventStore, getEventStore } from './store.js'
+export { EventStore, initEventStore, getEventStore, extractContextWindowId } from './store.js'
 
 // Types
 export type {
