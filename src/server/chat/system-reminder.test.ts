@@ -35,6 +35,18 @@ function createEventStore(initialEvents: any[] = []) {
         ['session.initialized', 'turn.snapshot', 'context.state', 'context.compacted'].includes(event.type),
       ),
     ),
+    // The fast path the store exposes: the window id of the last
+    // window-changing event.
+    getCurrentContextWindowId: vi.fn(() => {
+      const windowing = events.filter((event) =>
+        ['session.initialized', 'turn.snapshot', 'context.compacted'].includes(event.type),
+      )
+      const last = windowing[windowing.length - 1]
+      if (!last) return undefined
+      if (last.type === 'session.initialized') return last.data.contextWindowId
+      if (last.type === 'turn.snapshot') return last.data.currentContextWindowId
+      return last.data.subAgentId ? undefined : last.data.newWindowId
+    }),
     getAllEvents: vi.fn(() => events),
     getLatestSnapshot: vi.fn().mockReturnValue(undefined),
     getLatestSnapshotSeq: vi.fn(() => [...events].reverse().find((event) => event.type === 'turn.snapshot')?.seq ?? 0),

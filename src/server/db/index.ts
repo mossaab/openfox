@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3'
 import type { Config } from '../config.js'
 import { logger } from '../utils/logger.js'
-import { EVENTS_INDEX_DDL } from './events-schema.js'
+import { EVENTS_INDEX_DDL, EVENT_CONTEXT_WINDOW_DDL } from './events-schema.js'
 
 let db: Database.Database | null = null
 
@@ -238,6 +238,12 @@ function runMigrations(db: Database.Database): void {
   `)
 
   db.exec(EVENTS_INDEX_DDL)
+
+  // Side table holding the context window id each window-changing event
+  // assigns. Lets the hot path recover the current window without parsing the
+  // (potentially tens of MB) snapshot payload. Existing databases are backfilled
+  // lazily, per session, on first access.
+  db.exec(EVENT_CONTEXT_WINDOW_DDL)
 
   // Migration: Add per-session provider/model columns
   if (!columnNames.includes('provider_id')) {

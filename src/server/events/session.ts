@@ -35,7 +35,6 @@ import { getEventStore } from './store.js'
 import { getRuntimeConfig } from '../runtime-config.js'
 import {
   foldSessionState,
-  foldContextState,
   buildContextMessagesFromEventHistory,
   buildMessagesFromStoredEvents,
   spreadOptionalMessageFields,
@@ -321,12 +320,15 @@ export function getContextMessages(sessionId: string): ContextMessage[] {
  * Get current context window ID
  */
 export function getCurrentContextWindowId(sessionId: string): string | undefined {
-  // Only four event types feed the window id. Reading the whole log to recover
-  // it cost ~6 s of synchronous work per call on a 322k-event session, and this
-  // runs inside tool execution (sub-agents, MCP config, every LLM round).
+  // Only three event types feed the window id. Reading the whole log to
+  // recover it cost ~6 s of synchronous work per call on a 322k-event session,
+  // and this runs inside tool execution (sub-agents, MCP config, every LLM
+  // round). The store keeps a side table with the window id each of those
+  // events assigns, so the hot path is an index-only lookup instead of a
+  // JSON.parse of the snapshot payload (measured: 360 ms on a 25 MB snapshot).
+  // The store falls back to the original fold for legacy databases.
   const eventStore = getEventStore()
-  const contextResult = foldContextState(eventStore.getContextWindowEvents(sessionId), '')
-  return contextResult.currentContextWindowId || undefined
+  return eventStore.getCurrentContextWindowId(sessionId)
 }
 
 export function getCurrentWindowMessageOptions(sessionId: string): { contextWindowId: string } | undefined {

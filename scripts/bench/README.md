@@ -1,3 +1,79 @@
+# Benchmarks
+
+Two independent harnesses live here:
+
+- **Web memory** (below) — the browser-side memory footprint of a long,
+  fast-streaming conversation.
+- **Context-window lookup** — how long it takes to recover the current context
+  window id of a session with a huge snapshot.
+
+## Context-window lookup
+
+```bash
+npm run bench:context-window
+```
+
+Answers: "how long does it take to recover the current context window id?"
+
+The window id is carried by the event payloads, but a `turn.snapshot` payload
+is dominated by its `messages` array (tens of MB). The original path read the
+window-changing events and JSON-parsed their payloads — 252 ms on a 20 MiB
+snapshot, on a path that runs inside every tool execution and every LLM round.
+
+The harness builds a **disposable** synthetic database in a temp directory
+(deleted at the end) — no real database is ever opened — and measures three
+paths on it:
+
+| path                                        | what it measures              |
+| ------------------------------------------- | ----------------------------- |
+| `legacy — fold over parsed payloads`        | the original implementation   |
+| `fast — side table lookup`                  | the current implementation    |
+| `legacy — first access (backfill + lookup)` | a legacy database, first read |
+
+The backfill is what a database created before the side table pays once: the
+window-changing events are parsed, the side table is filled, and every later
+read is a plain lookup.
+
+### Knobs
+
+| env                        | default | meaning                                  |
+| -------------------------- | ------- | ---------------------------------------- |
+| `BENCH_CW_MESSAGES`        | 1761    | messages in the synthetic snapshot       |
+| `BENCH_CW_MESSAGE_CHARS`   | 12000   | characters per message                   |
+| `BENCH_CW_ITERATIONS`      | 20      | samples per measurement (median is used) |
+| `BENCH_CW_LEGACY_SESSIONS` | 3       | sessions seeded without a side-table row |
+
+### Measured (2026-11-14, 20.3 MiB snapshot, 1761 messages)
+
+| path                                        | median      |
+| ------------------------------------------- | ----------- |
+| `legacy — fold over parsed payloads`        | 252 ms      |
+| `fast — side table lookup`                  | **0.15 ms** |
+| `legacy — first access (backfill + lookup)` | 89 ms       |
+| `fast — steady state after backfill`        | 0.14 ms     |
+
+~1600x on the hot path, and the legacy first access is paid only once per
+session.
+
+### Write path
+
+The side table must not tax the hottest write path. Ordinary events
+(`message.delta` and friends) keep the historical shape of `append()` — a bare
+`INSERT`, no explicit transaction; only the three window-changing event types
+are wrapped in one, so their side-table row is written atomically with them.
+
+| 10 000 ordinary appends        | per event          |
+| ------------------------------ | ------------------ |
+| current store                  | 343 µs             |
+| historical shape (bare INSERT) | 359 µs             |
+| **overhead**                   | **−4,5 %** (noise) |
+
+Wrapping _every_ event in a transaction — the first implementation of the side
+table — cost **+30,3 %** (447 µs/event vs 343 µs). The `WHEN` clause on the
+cleanup trigger keeps the delete path free too.
+
+---
+
 # Web memory benchmark
 
 Baseline harness for the browser-side memory footprint of a long, fast-streaming

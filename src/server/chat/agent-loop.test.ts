@@ -79,6 +79,7 @@ describe('executeTools', () => {
       append: vi.fn(),
       getEvents: vi.fn().mockReturnValue([]),
       getContextWindowEvents: vi.fn().mockReturnValue([]),
+      getCurrentContextWindowId: vi.fn().mockReturnValue(undefined),
     } as unknown as EventStore
 
     // Mock the event store singleton
@@ -320,6 +321,7 @@ describe('runTopLevelAgentLoop assembleRequest', () => {
       append: vi.fn(),
       getEvents: vi.fn().mockReturnValue([]),
       getContextWindowEvents: vi.fn().mockReturnValue([]),
+      getCurrentContextWindowId: vi.fn().mockReturnValue(undefined),
       getLatestSeq: vi.fn().mockReturnValue(0),
       cleanupOldEvents: vi.fn().mockReturnValue(0),
     } as unknown as EventStore
@@ -420,6 +422,7 @@ describe('runTopLevelAgentLoop compaction', () => {
       append: vi.fn(),
       getEvents: vi.fn().mockReturnValue([]),
       getContextWindowEvents: vi.fn().mockReturnValue([]),
+      getCurrentContextWindowId: vi.fn().mockReturnValue(undefined),
       getLatestSeq: vi.fn().mockReturnValue(0),
       cleanupOldEvents: vi.fn().mockReturnValue(0),
     } as unknown as EventStore
@@ -634,6 +637,7 @@ describe('maxTokens clamping', () => {
       append: vi.fn(),
       getEvents: vi.fn().mockReturnValue([]),
       getContextWindowEvents: vi.fn().mockReturnValue([]),
+      getCurrentContextWindowId: vi.fn().mockReturnValue(undefined),
       getLatestSeq: vi.fn().mockReturnValue(0),
       cleanupOldEvents: vi.fn().mockReturnValue(0),
     } as unknown as EventStore
@@ -2004,6 +2008,7 @@ describe('runTopLevelAgentLoop live stats', () => {
       append: vi.fn(),
       getEvents: vi.fn().mockReturnValue([]),
       getContextWindowEvents: vi.fn().mockReturnValue([]),
+      getCurrentContextWindowId: vi.fn().mockReturnValue(undefined),
       getLatestSeq: vi.fn().mockReturnValue(0),
       cleanupOldEvents: vi.fn().mockReturnValue(0),
     } as unknown as EventStore
@@ -2143,6 +2148,7 @@ describe('runTopLevelAgentLoop queue draining', () => {
       append: vi.fn(),
       getEvents: vi.fn().mockReturnValue([]),
       getContextWindowEvents: vi.fn().mockReturnValue([]),
+      getCurrentContextWindowId: vi.fn().mockReturnValue(undefined),
       getLatestSeq: vi.fn().mockReturnValue(0),
       cleanupOldEvents: vi.fn().mockReturnValue(0),
     } as unknown as EventStore
@@ -2296,6 +2302,7 @@ describe('runTopLevelAgentLoop plugin message transforms', () => {
       append: vi.fn(),
       getEvents: vi.fn().mockReturnValue([]),
       getContextWindowEvents: vi.fn().mockReturnValue([]),
+      getCurrentContextWindowId: vi.fn().mockReturnValue(undefined),
       getLatestSeq: vi.fn().mockReturnValue(0),
       cleanupOldEvents: vi.fn().mockReturnValue(0),
     } as unknown as EventStore
@@ -2416,6 +2423,7 @@ describe('runTopLevelAgentLoop night mode', () => {
       append: vi.fn(),
       getEvents: vi.fn().mockReturnValue([]),
       getContextWindowEvents: vi.fn().mockReturnValue([]),
+      getCurrentContextWindowId: vi.fn().mockReturnValue(undefined),
       getLatestSeq: vi.fn().mockReturnValue(0),
       cleanupOldEvents: vi.fn().mockReturnValue(0),
     } as unknown as EventStore

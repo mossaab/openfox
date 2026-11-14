@@ -18,9 +18,9 @@ import type Database from 'better-sqlite3'
 import { existsSync, statSync, unlinkSync } from 'node:fs'
 import type { TurnEvent, StoredEvent, SessionSnapshot, SnapshotMessage } from './types.js'
 import { logger } from '../utils/logger.js'
-import { foldSessionState, buildSnapshot, trimSnapshotStreamingOutput } from './folding.js'
+import { foldSessionState, foldContextState, buildSnapshot, trimSnapshotStreamingOutput } from './folding.js'
 import { SETTINGS_KEYS } from '../db/settings.js'
-import { EVENTS_INDEX_DDL } from '../db/events-schema.js'
+import { EVENTS_INDEX_DDL, EVENT_CONTEXT_WINDOW_DDL } from '../db/events-schema.js'
 
 // Rollback backups (.pre-de-dup.bak) are held for 10 days after creation, then
 // auto-pruned on the next migration invocation (startup auto-run or manual
@@ -41,12 +41,70 @@ const SLOW_LOAD_WARN_THROTTLE_MS = 60 * 1000
 const DB_SIZE_WARN_BYTES = 300 * 1024 * 1024
 
 /**
+ * Normalize a window id read from the side table.
+ *
+ * The original fold spelled "no window" as an empty string, and the public
+ * API spells it `undefined`. An empty window id is therefore "no window" —
+ * the fast path must not hand back a `''` where the slow path returned
+ * `undefined`.
+ */
+function normalizeWindowId(windowId: string | null): string | undefined {
+  return windowId ? windowId : undefined
+}
+
+/**
  * Detect a UNIQUE constraint violation (e.g. another openfox instance writing
  * to the same database concurrently). Used to retry appends with the next seq.
  */
 function isUniqueConstraintError(error: unknown): boolean {
   const err = error as NodeJS.ErrnoException
   return err?.code === 'SQLITE_CONSTRAINT_UNIQUE' || (err?.message ?? '').includes('UNIQUE constraint failed')
+}
+
+/**
+ * The context window id a window-changing event assigns.
+ *
+ * These are the exact three rules `foldContextState` applies (see
+ * `src/server/events/fold-state.ts`):
+ * - `session.initialized` → the session's first window.
+ * - `turn.snapshot` → the snapshot's absolute current window.
+ * - `context.compacted` → the new window, but ONLY for the parent scope: a
+ *   sub-agent compaction leaves the parent's window untouched.
+ *
+ * Everything else (`context.state`, `file.read`, ...) never moves the window.
+ *
+ * Kept in one place so the fast path (side table) and the slow path
+ * (`foldContextState`) can never disagree about which events matter.
+ *
+ * Three-valued on purpose — `foldContextState` assigns the window
+ * UNCONDITIONALLY for those three event types, so an event carrying no window
+ * id still RESETS the current window to undefined:
+ * - `undefined` → the event does not assign a window at all (not recorded).
+ * - `null` → the event assigns "no window" (resets it).
+ * - `string` → the event assigns that window.
+ */
+export function extractContextWindowId(event: { type: string; data: unknown }): string | null | undefined {
+  switch (event.type) {
+    case 'session.initialized': {
+      const data = event.data as Extract<TurnEvent, { type: 'session.initialized' }>['data']
+      const windowId = data?.contextWindowId
+      return typeof windowId === 'string' ? windowId : null
+    }
+    case 'turn.snapshot': {
+      const data = event.data as Partial<SessionSnapshot>
+      const windowId = data?.currentContextWindowId
+      return typeof windowId === 'string' ? windowId : null
+    }
+    case 'context.compacted': {
+      const data = event.data as Extract<TurnEvent, { type: 'context.compacted' }>['data']
+      // A sub-agent compaction closes the SUB-agent's window, not the parent's.
+      if (data?.subAgentId) return undefined
+      const windowId = data?.newWindowId
+      return typeof windowId === 'string' ? windowId : null
+    }
+    default:
+      return undefined
+  }
 }
 
 // ============================================================================
@@ -211,6 +269,8 @@ export class EventStore {
 
     this.db.exec(EVENTS_INDEX_DDL)
 
+    this.db.exec(EVENT_CONTEXT_WINDOW_DDL)
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tombstones (
         session_id TEXT NOT NULL,
@@ -252,10 +312,29 @@ export class EventStore {
 
     // Multi-process safety: another openfox instance may have taken our
     // computed seq between the MAX read and the INSERT. Probe forward.
+    //
+    // Ordinary events keep the EXACT historical path — a single bare INSERT,
+    // no explicit transaction. Only window-changing events need the side
+    // table, and they are rare; wrapping every `message.delta` in a
+    // BEGIN/COMMIT would tax the hottest write path for nothing.
     let seq = this.getNextSeq(sessionId)
     for (let attempt = 0; attempt < 100; attempt++) {
       try {
-        insert.run(sessionId, seq, timestamp, event.type, JSON.stringify(event.data))
+        if (
+          event.type === 'session.initialized' ||
+          event.type === 'turn.snapshot' ||
+          event.type === 'context.compacted'
+        ) {
+          // Window-changing event: the side-table row must be written with
+          // the event, atomically.
+          const write = this.db.transaction(() => {
+            insert.run(sessionId, seq, timestamp, event.type, JSON.stringify(event.data))
+            this.recordContextWindow(sessionId, seq, event)
+          })
+          write()
+        } else {
+          insert.run(sessionId, seq, timestamp, event.type, JSON.stringify(event.data))
+        }
         break
       } catch (error) {
         if (!isUniqueConstraintError(error) || attempt === 99) throw error
@@ -306,6 +385,7 @@ export class EventStore {
           let seq = baseSeq
           for (const event of events) {
             insert.run(sessionId, seq, timestamp, event.type, JSON.stringify(event.data))
+            this.recordContextWindow(sessionId, seq, event)
             const stored: StoredEvent = {
               seq,
               timestamp,
@@ -352,6 +432,7 @@ export class EventStore {
     const transaction = this.db.transaction(() => {
       for (const event of events) {
         insert.run(sessionId, event.seq, event.timestamp, event.type, JSON.stringify(event.data))
+        this.recordContextWindow(sessionId, event.seq, event)
       }
     })
     transaction()
@@ -370,6 +451,37 @@ export class EventStore {
       { max_seq: number | null } | undefined
 
     return (row?.max_seq ?? 0) + 1
+  }
+
+  /**
+   * Record the context window an event assigns, in the side table.
+   *
+   * Only window-changing events are written (`extractContextWindowId`), so the
+   * table stays tiny — a few rows per session, not one per event. The write
+   * happens inside the same transaction as the event insert, so the side table
+   * can never disagree with the event log.
+   *
+   * A `null` window (the event resets the window to "none") is recorded as a
+   * row with a NULL `window_id`: the fast path must reproduce the reset, not
+   * skip it.
+   *
+   * An `undefined` window means the event does NOT assign a window (e.g. a
+   * sub-agent compaction). Any row left over from a previous payload is
+   * removed, so a rewritten payload can never leave a stale assignment behind.
+   */
+  private recordContextWindow(sessionId: string, seq: number, event: { type: string; data: unknown }): void {
+    const windowId = extractContextWindowId(event)
+    if (windowId === undefined) {
+      this.db.prepare(`DELETE FROM event_context_window WHERE session_id = ? AND seq = ?`).run(sessionId, seq)
+      return
+    }
+    this.db
+      .prepare(
+        `INSERT INTO event_context_window (session_id, seq, event_type, window_id)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(session_id, seq) DO UPDATE SET event_type = excluded.event_type, window_id = excluded.window_id`,
+      )
+      .run(sessionId, seq, event.type, windowId)
   }
 
   // --------------------------------------------------------------------------
@@ -433,9 +545,22 @@ export class EventStore {
    * Used to persist enriched data (e.g., vision fallback descriptions) back to the store.
    */
   updateEventPayload(sessionId: string, seq: number, data: unknown): void {
-    this.db
-      .prepare(`UPDATE events SET payload = ? WHERE session_id = ? AND seq = ?`)
-      .run(JSON.stringify(data), sessionId, seq)
+    const typeRow = this.db
+      .prepare(`SELECT event_type FROM events WHERE session_id = ? AND seq = ?`)
+      .get(sessionId, seq) as { event_type: string } | undefined
+
+    const write = this.db.transaction(() => {
+      this.db
+        .prepare(`UPDATE events SET payload = ? WHERE session_id = ? AND seq = ?`)
+        .run(JSON.stringify(data), sessionId, seq)
+      // The side table mirrors the payload's window id — it must follow the
+      // rewrite, or the fast path would answer with the pre-rewrite window.
+      if (typeRow) {
+        this.recordContextWindow(sessionId, seq, { type: typeRow.event_type, data })
+      }
+    })
+    write()
+
     this.invalidateSessionCache(sessionId)
   }
 
@@ -774,6 +899,139 @@ export class EventStore {
   }
 
   /**
+   * Read the last window assignment of a session.
+   *
+   * This is the hot path: it runs inside every tool execution (sub-agents,
+   * MCP config, compaction) and every LLM round. The window id is carried by
+   * the event payloads, but a `turn.snapshot` payload is dominated by its
+   * `messages` array — JSON-parsing it cost 360 ms on a 25 MB snapshot. The
+   * side table answers the question with an index-only lookup.
+   *
+   * The JOIN on `events` is what keeps the side table honest: a row whose
+   * event was deleted (`cleanupOldEvents`, `deleteEventsUpToSeq`,
+   * `deleteSession`) or tombstoned is invisible here, exactly as it is in
+   * `getEvents`. The `events` table stays the single source of truth.
+   *
+   * `found` distinguishes "this session has no window-changing event" (the
+   * side table has no row) from "the last window-changing event reset the
+   * window to none" (`windowId === null`). Both are meaningful and must not be
+   * confused: only the first one means the side table needs a backfill.
+   */
+  private queryContextWindow(sessionId: string): { found: boolean; windowId: string | null } {
+    const row = this.db
+      .prepare(
+        `SELECT w.window_id AS window_id
+         FROM event_context_window w
+         JOIN events e ON e.session_id = w.session_id AND e.seq = w.seq
+         WHERE w.session_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM tombstones t WHERE t.session_id = w.session_id AND t.seq = w.seq
+           )
+         ORDER BY w.seq DESC
+         LIMIT 1`,
+      )
+      .get(sessionId) as { window_id: string | null } | undefined
+
+    if (row === undefined) return { found: false, windowId: null }
+    return { found: true, windowId: row.window_id }
+  }
+
+  /**
+   * Backfill the side table for a session from the event log.
+   *
+   * Only needed for databases created before the side table existed: their
+   * events carry the window id in their payload, but no side-table row.
+   * The window-changing events are read one by one and only their window id is
+   * extracted — the snapshot payload is parsed once, then discarded.
+   *
+   * Safe to call repeatedly: it only inserts rows that are missing, and the
+   * insert is idempotent (`ON CONFLICT DO UPDATE`).
+   */
+  backfillContextWindows(sessionId: string): number {
+    const rows = this.db
+      .prepare(
+        `SELECT e.seq AS seq, e.event_type AS event_type, e.payload AS payload
+         FROM events e
+         WHERE e.session_id = ?
+           AND e.event_type IN ('session.initialized', 'turn.snapshot', 'context.compacted')
+           AND NOT EXISTS (
+             SELECT 1 FROM event_context_window w WHERE w.session_id = e.session_id AND w.seq = e.seq
+           )
+         ORDER BY e.seq`,
+      )
+      .all(sessionId) as Array<{ seq: number; event_type: string; payload: string }>
+
+    if (rows.length === 0) return 0
+
+    const insert = this.db.prepare(
+      `INSERT INTO event_context_window (session_id, seq, event_type, window_id)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(session_id, seq) DO UPDATE SET event_type = excluded.event_type, window_id = excluded.window_id`,
+    )
+
+    let written = 0
+    this.db.transaction(() => {
+      for (const row of rows) {
+        let data: unknown
+        try {
+          data = JSON.parse(row.payload)
+        } catch {
+          continue
+        }
+        const windowId = extractContextWindowId({ type: row.event_type, data })
+        // `undefined` = the event does not assign a window (e.g. a sub-agent
+        // compaction): no row at all. `null` = the event resets the window:
+        // recorded as a NULL window_id.
+        if (windowId === undefined) continue
+        insert.run(sessionId, row.seq, row.event_type, windowId)
+        written++
+      }
+    })()
+
+    return written
+  }
+
+  /**
+   * The current context window id, with the fast path preferred and the
+   * original fold as a fallback.
+   *
+   * The fallback covers legacy databases (no side-table rows yet): the first
+   * call backfills the session, so every later call is fast. If the backfill
+   * cannot write (read-only database), the original fold answers instead —
+   * slower, but always correct.
+   *
+   * The result is identical to
+   * `foldContextState(getContextWindowEvents(sessionId), '').currentContextWindowId`
+   * — that equivalence is what the unit tests pin down. The only difference is
+   * the empty-string / `undefined` spelling of "no window".
+   */
+  getCurrentContextWindowId(sessionId: string): string | undefined {
+    const result = this.queryContextWindow(sessionId)
+    if (result.found) return normalizeWindowId(result.windowId)
+
+    // Legacy database: no side-table row for this session. Backfill (once) and
+    // retry before falling back to the original fold.
+    try {
+      if (this.backfillContextWindows(sessionId) > 0) {
+        const backfilled = this.queryContextWindow(sessionId)
+        if (backfilled.found) return normalizeWindowId(backfilled.windowId)
+      }
+    } catch (error) {
+      // A read-only database (or a locked one) must not break the lookup —
+      // the original fold below answers correctly, just slower.
+      logger.debug('Context window backfill failed, falling back to the full fold', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+
+    // No window-changing event at all, or the backfill was impossible: read
+    // the window-changing events and fold them, exactly as before.
+    const folded = foldContextState(this.getContextWindowEvents(sessionId), '')
+    return folded.currentContextWindowId || undefined
+  }
+
+  /**
    * Get ALL events for a session, including synthetic events reconstructed
    * from the latest snapshot's messages. This provides a unified view of the
    * full event history even after cleanupOldEvents has deleted raw events.
@@ -931,6 +1189,7 @@ export class EventStore {
    */
   deleteSession(sessionId: string): void {
     this.db.prepare(`DELETE FROM events WHERE session_id = ?`).run(sessionId)
+    this.db.prepare(`DELETE FROM event_context_window WHERE session_id = ?`).run(sessionId)
     this.invalidateSessionCache(sessionId)
 
     // Close all subscribers for this session
@@ -954,6 +1213,7 @@ export class EventStore {
    */
   deleteEventsUpToSeq(sessionId: string, upToSeq: number): number {
     const result = this.db.prepare(`DELETE FROM events WHERE session_id = ? AND seq <= ?`).run(sessionId, upToSeq)
+    this.db.prepare(`DELETE FROM event_context_window WHERE session_id = ? AND seq <= ?`).run(sessionId, upToSeq)
     this.invalidateSessionCache(sessionId)
 
     return result.changes as number
@@ -970,6 +1230,7 @@ export class EventStore {
    */
   deleteEventsAfterSeq(sessionId: string, fromSeq: number): number {
     const result = this.db.prepare(`DELETE FROM events WHERE session_id = ? AND seq > ?`).run(sessionId, fromSeq)
+    this.db.prepare(`DELETE FROM event_context_window WHERE session_id = ? AND seq > ?`).run(sessionId, fromSeq)
     this.invalidateSessionCache(sessionId)
 
     return result.changes as number
@@ -1019,6 +1280,26 @@ export class EventStore {
       )
       .run(sessionId, latestSnapshotSeq)
 
+    // The side table mirrors the surviving events: drop the rows whose event
+    // was just deleted (the same predicate), so it cannot drift from the log.
+    this.db
+      .prepare(
+        `
+        DELETE FROM event_context_window
+        WHERE session_id = ? AND seq > 1 AND seq < ?
+        AND event_type NOT IN (
+          'criteria.set',
+          'criterion.updated',
+          'mode.changed',
+          'phase.changed',
+          'todo.updated',
+          'context.state',
+          'metadata.set'
+        )
+      `,
+      )
+      .run(sessionId, latestSnapshotSeq)
+
     this.invalidateSessionCache(sessionId)
 
     return result.changes as number
@@ -1042,6 +1323,22 @@ export class EventStore {
             WHERE e2.session_id = e1.session_id
             AND e2.event_type = 'turn.snapshot'
           )
+        )
+      `,
+      )
+      .run()
+
+    // The side table mirrors the surviving events: drop the rows of the
+    // snapshots that were just deleted.
+    this.db
+      .prepare(
+        `
+        DELETE FROM event_context_window
+        WHERE event_type = 'turn.snapshot'
+        AND NOT EXISTS (
+          SELECT 1 FROM events e
+          WHERE e.session_id = event_context_window.session_id
+            AND e.seq = event_context_window.seq
         )
       `,
       )
@@ -1105,6 +1402,18 @@ export class EventStore {
         .prepare(
           `
         DELETE FROM events 
+        WHERE session_id = ? AND seq <= ?
+        AND event_type != 'session.initialized'
+      `,
+        )
+        .run(sessionId, latestSeq)
+
+      // The side table mirrors the surviving events — drop the rows of the
+      // events that were just deleted.
+      this.db
+        .prepare(
+          `
+        DELETE FROM event_context_window
         WHERE session_id = ? AND seq <= ?
         AND event_type != 'session.initialized'
       `,
